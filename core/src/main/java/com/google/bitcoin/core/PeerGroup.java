@@ -33,6 +33,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
+import com.google.common.net.InetAddresses;
 import com.google.common.primitives.Ints;
 import com.google.common.primitives.Longs;
 import com.google.common.util.concurrent.*;
@@ -42,8 +43,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
@@ -76,7 +79,7 @@ import static com.google.common.base.Preconditions.checkState;
 public class PeerGroup extends AbstractExecutionThreadService implements TransactionBroadcaster {
     private static final Logger log = LoggerFactory.getLogger(PeerGroup.class);
     private static final int DEFAULT_CONNECTIONS = 4;
-    private static final int TOR_TIMEOUT_SECONDS = 20;
+    private static final int TOR_TIMEOUT_SECONDS = 60;
 
     protected final ReentrantLock lock = Threading.lock("peergroup");
 
@@ -118,6 +121,8 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
     /** How many milliseconds to wait after receiving a pong before sending another ping. */
     public static final long DEFAULT_PING_INTERVAL_MSEC = 2000;
     private long pingIntervalMsec = DEFAULT_PING_INTERVAL_MSEC;
+
+    @GuardedBy("lock") private boolean useLocalhostPeerWhenPossible = true;
 
     private final NetworkParameters params;
     private final AbstractBlockChain chain;
@@ -236,7 +241,7 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
         }
     }
 
-    // Visible for testing
+    @VisibleForTesting
     PeerEventListener startupListener = new PeerStartupListener();
 
     /**
@@ -687,6 +692,36 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
         }
     }
 
+    private enum LocalhostCheckState {
+        NOT_TRIED,
+        FOUND,
+        FOUND_AND_CONNECTED,
+        NOT_THERE
+    }
+    private LocalhostCheckState localhostCheckState = LocalhostCheckState.NOT_TRIED;
+
+    private boolean maybeCheckForLocalhostPeer() {
+        checkState(lock.isHeldByCurrentThread());
+        if (localhostCheckState == LocalhostCheckState.NOT_TRIED) {
+            // Do a fast blocking connect to see if anything is listening.
+            try {
+                Socket socket = new Socket();
+                socket.connect(new InetSocketAddress(InetAddresses.forString("127.0.0.1"), params.getPort()), vConnectTimeoutMillis);
+                localhostCheckState = LocalhostCheckState.FOUND;
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    // Ignore.
+                }
+                return true;
+            } catch (IOException e) {
+                log.info("Localhost peer not detected.");
+                localhostCheckState = LocalhostCheckState.NOT_THERE;
+            }
+        }
+        return false;
+    }
+
     /** Picks a peer from discovery and connects to it. If connection fails, picks another and tries again. */
     protected void connectToAnyPeer() throws PeerDiscoveryException {
         final State state = state();
@@ -698,6 +733,12 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
         long retryTime = 0;
         lock.lock();
         try {
+            if (useLocalhostPeerWhenPossible && maybeCheckForLocalhostPeer()) {
+                log.info("Localhost peer detected, trying to use it instead of P2P discovery");
+                maxConnections = 0;
+                connectToLocalHost();
+                return;
+            }
             if (!haveReadyInactivePeer(nowMillis)) {
                 discoverPeers();
                 groupBackoff.trackSuccess();
@@ -716,14 +757,14 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
             if (retryTime > nowMillis) {
                 // Sleep until retry time
                 final long millis = retryTime - nowMillis;
-                log.info("Waiting {} msec before next connect attempt {}", millis, addr == null ? "" : " to " + addr);
+                log.info("Waiting {} msec before next connect attempt {}", millis, addr == null ? "" : "to " + addr);
                 Utils.sleep(millis);
             }
         }
 
         // This method constructs a Peer and puts it into pendingPeers.
         checkNotNull(addr);   // Help static analysis which can't see that addr is always set if we didn't throw above.
-        connectTo(addr, false);
+        connectTo(addr, false, vConnectTimeoutMillis);
     }
 
     private boolean haveReadyInactivePeer(long nowMillis) {
@@ -931,7 +972,7 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
     public Peer connectTo(InetSocketAddress address) {
         PeerAddress peerAddress = new PeerAddress(address);
         backoffMap.put(peerAddress, new ExponentialBackoff(peerBackoffParams));
-        return connectTo(peerAddress, true);
+        return connectTo(peerAddress, true, vConnectTimeoutMillis);
     }
 
     /**
@@ -941,12 +982,19 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
     public Peer connectToLocalHost() {
         final PeerAddress localhost = PeerAddress.localhost(params);
         backoffMap.put(localhost, new ExponentialBackoff(peerBackoffParams));
-        return connectTo(localhost, true);
+        return connectTo(localhost, true, vConnectTimeoutMillis);
     }
 
-    // Internal version.
+    /**
+     * Creates a version message to send, constructs a Peer object and attempts to connect it. Returns the peer on
+     * success or null on failure.
+     * @param address Remote network address
+     * @param incrementMaxConnections Whether to consider this connection an attempt to fill our quota, or something
+     *                                explicitly requested.
+     * @return Peer or null.
+     */
     @Nullable
-    protected Peer connectTo(PeerAddress address, boolean incrementMaxConnections) {
+    protected Peer connectTo(PeerAddress address, boolean incrementMaxConnections, int connectTimeoutMillis) {
         VersionMessage ver = getVersionMessage().duplicate();
         ver.bestHeight = chain == null ? 0 : chain.getBestChainHeight();
         ver.time = Utils.currentTimeSeconds();
@@ -963,7 +1011,7 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
             handlePeerDeath(peer);
             return null;
         }
-        peer.setSocketTimeout(vConnectTimeoutMillis);
+        peer.setSocketTimeout(connectTimeoutMillis);
         // When the channel has connected and version negotiated successfully, handleNewPeer will end up being called on
         // a worker thread.
 
@@ -1576,8 +1624,35 @@ public class PeerGroup extends AbstractExecutionThreadService implements Transac
         }
     }
 
+    /**
+     * Returns the {@link com.subgraph.orchid.TorClient} object for this peer group, if Tor is in use, null otherwise.
+     */
+    @Nullable
     public TorClient getTorClient() {
         return torClient;
     }
 
+    /** See {@link #setUseLocalhostPeerWhenPossible(boolean)} */
+    public boolean getUseLocalhostPeerWhenPossible() {
+        lock.lock();
+        try {
+            return useLocalhostPeerWhenPossible;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * When true (the default), PeerGroup will attempt to connect to a Bitcoin node running on localhost before
+     * attempting to use the P2P network. If successful, only localhost will be used. This makes for a simple
+     * and easy way for a user to upgrade a bitcoinj based app running in SPV mode to fully validating security.
+     */
+    public void setUseLocalhostPeerWhenPossible(boolean useLocalhostPeerWhenPossible) {
+        lock.lock();
+        try {
+            this.useLocalhostPeerWhenPossible = useLocalhostPeerWhenPossible;
+        } finally {
+            lock.unlock();
+        }
+    }
 }
