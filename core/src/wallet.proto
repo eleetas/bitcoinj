@@ -66,6 +66,10 @@ message DeterministicKey {
    * a single P2SH multisignature address
    */
   optional bool isFollowing = 5;
+
+  // Number of signatures required to spend. This field is needed only for married keychains to reconstruct KeyChain
+  // and represents the N value from N-of-M CHECKMULTISIG script. For regular single keychains it will always be 1.
+  optional uint32 sigsRequiredToSpend = 6 [default = 1];
 }
 
 /**
@@ -105,6 +109,7 @@ message Key {
   // Either the private EC key bytes (without any ASN.1 wrapping), or the deterministic root seed.
   // If the secret is encrypted, or this is a "watching entry" then this is missing.
   optional bytes secret_bytes = 2;
+
   // If the secret data is encrypted, then secret_bytes is missing and this field is set.
   optional EncryptedData encrypted_data = 6;
 
@@ -120,6 +125,13 @@ message Key {
   optional int64 creation_timestamp = 5;
 
   optional DeterministicKey deterministic_key = 7;
+
+  // The seed for a deterministic key hierarchy.  Derived from the mnemonic,
+  // but cached here for quick startup.  Only applicable to a DETERMINISTIC_MNEMONIC key entry.
+  optional bytes deterministic_seed = 8;
+
+  // Encrypted version of the seed
+  optional EncryptedData encrypted_deterministic_seed = 9;
 }
 
 message Script {
@@ -182,9 +194,8 @@ message TransactionConfidence {
   // Zero confirmations: depth = 0, one confirmation: depth = 1 etc.
   optional int32 depth = 4;
 
-  // If type == BUILDING then this is the cumulative workDone for the block the transaction appears in, together with
-  // all blocks that bury it.
-  optional int64 work_done = 5;
+  // deprecated - do not recycle this numeric identifier
+  // optional int64 work_done = 5;
 
   repeated PeerAddress broadcast_by = 6;
 
@@ -264,7 +275,14 @@ message Transaction {
   }
   optional Purpose purpose = 10 [default = UNKNOWN];
 
-  // Next tag: 12
+  // Exchange rate that was valid when the transaction was sent.
+  optional ExchangeRate exchange_rate = 12;
+
+  // Memo of the transaction. It can be used to record the memo of the payment request that initiated the
+  // transaction.
+  optional string memo = 13;
+
+  // Next tag: 14
 }
 
 /** The parameters used in the scrypt key derivation function.
@@ -366,4 +384,16 @@ message Wallet {
   repeated TransactionSigner transaction_signers = 17;
 
   // Next tag: 18
+}
+
+/** An exchange rate between Bitcoin and some fiat currency. */
+message ExchangeRate {
+  // This much of satoshis (1E-8 fractions)…
+  required int64 coin_value = 1;
+  // …is worth this much of fiat (1E-4 fractions).
+  required int64 fiat_value = 2;
+  // ISO 4217 currency code (if available) of the fiat currency.
+  required string fiat_currency_code = 3;
+
+  // Next tag: 4
 }
