@@ -180,7 +180,8 @@ public class WalletTool {
     }
     
     public enum NetworkEnum {
-        PROD,
+        MAIN,
+        PROD, // alias for MAIN
         TEST,
         REGTEST
     }
@@ -198,7 +199,7 @@ public class WalletTool {
         OptionSpec<String> walletFileName = parser.accepts("wallet").withRequiredArg().defaultsTo("wallet");
         seedFlag = parser.accepts("seed").withRequiredArg();
         watchFlag = parser.accepts("watchkey").withRequiredArg();
-        OptionSpec<NetworkEnum> netFlag = parser.accepts("net").withOptionalArg().ofType(NetworkEnum.class).defaultsTo(NetworkEnum.PROD);
+        OptionSpec<NetworkEnum> netFlag = parser.accepts("net").withOptionalArg().ofType(NetworkEnum.class).defaultsTo(NetworkEnum.MAIN);
         dateFlag = parser.accepts("date").withRequiredArg().ofType(Date.class)
                 .withValuesConvertedBy(DateConverter.datePattern("yyyy/MM/dd"));
         OptionSpec<WaitForEnum> waitForFlag = parser.accepts("waitfor").withRequiredArg().ofType(WaitForEnum.class);
@@ -255,9 +256,10 @@ public class WalletTool {
             logger.setLevel(Level.SEVERE);
         }
         switch (netFlag.value(options)) {
+            case MAIN:
             case PROD:
                 params = MainNetParams.get();
-                chainFileName = new File("prodnet.chain");
+                chainFileName = new File("mainnet.chain");
                 break;
             case TEST:
                 params = TestNet3Params.get();
@@ -446,9 +448,10 @@ public class WalletTool {
         long rotationTimeSecs = Utils.currentTimeSeconds();
         if (options.has(dateFlag)) {
             rotationTimeSecs = options.valueOf(dateFlag).getTime() / 1000;
+        } else if (options.has(unixtimeFlag)) {
+            rotationTimeSecs = options.valueOf(unixtimeFlag);
         }
         log.info("Setting wallet key rotation time to {}", rotationTimeSecs);
-        wallet.setKeyRotationEnabled(true);
         wallet.setKeyRotationTime(rotationTimeSecs);
         KeyParameter aesKey = null;
         if (wallet.isEncrypted()) {
@@ -456,7 +459,7 @@ public class WalletTool {
             if (aesKey == null)
                 return;
         }
-        Futures.getUnchecked(wallet.maybeDoMaintenance(aesKey, true));
+        Futures.getUnchecked(wallet.doMaintenance(aesKey, true));
     }
 
     private static void encrypt() {
@@ -817,6 +820,8 @@ public class WalletTool {
             peers = new PeerGroup(params, chain);
         }
         peers.setUserAgent("WalletTool", "1.0");
+        if (params == RegTestParams.get())
+            peers.setMinBroadcastConnections(1);
         peers.addWallet(wallet);
         if (options.has("peers")) {
             String peersFlag = (String) options.valueOf("peers");
@@ -830,13 +835,7 @@ public class WalletTool {
                 }
             }
         } else if (!options.has("tor")) {
-            // If Tor mode then PeerGroup already has discovery set up.
-//            if (params == RegTestParams.get()) {
-//                log.info("Assuming regtest node on localhost");
-//                peers.addAddress(PeerAddress.localhost(params));
-//            } else {
-                peers.addPeerDiscovery(new DnsDiscovery(params));
-            //}
+            peers.addPeerDiscovery(new DnsDiscovery(params));
         }
     }
 
